@@ -5,3 +5,4 @@
 azure-functions
 azure-cosmos
 pytz
+psycopg2-binary==2.8.6

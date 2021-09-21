@@ -5,6 +5,7 @@ from azure.cosmos import CosmosClient
 from datetime import datetime
 from pytz import timezone
 import pytz
+import psycopg2
 
 url = "https://altolido.documents.azure.com:443/"
 key = "d1ebjRT7a5n3k7fyHSQM2TJRVb5lxHYor7xgyW6skWkKiEge2z6HMGSTiIg6YNJo7D7mt1ZryAgiT6fZv8rcEg=="
@@ -14,13 +15,51 @@ database = client.get_database_client(database_name)
 container_name = 'lido'
 container = database.get_container_client(container_name)
 
+# Update connection string information
+host = "altoiotmonitor.postgres.database.azure.com"
+dbname = "postgres"
+user = "altoiotmonitor@altoiotmonitor"
+password = "Magicalmint636"
+#sslmode = "require"
+
+
+def electricity_rate():
+    # Construct connection string
+    conn_string = "host={0} user={1} dbname={2} password={3}".format(host, user, dbname, password)
+    conn = psycopg2.connect(conn_string)
+    print("Connection established")
+    cursor = conn.cursor()
+    # Fetch all rows from table
+    cursor.execute("SELECT electricity_rate FROM settings WHERE building_id = 1;")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows[0][0]
+
 def query_cosmos_ts(**kw):
     
     query_string=f"SELECT * from c where\
         c.device_id = '{kw['device_id']}' \
         and c.timestamp >= {kw['start_time']}\
         and c.timestamp <= {kw['end_time']} \
-        order by c.timestamp DESC"
+        order by c.timestamp DESC OFFSET 0 LIMIT 1"
+    
+
+    res = []
+    for item in container.query_items(
+            query=query_string,
+            enable_cross_partition_query=True):
+        res.append(item)
+    
+    return res
+
+def query_power_1440min(**kw):
+    time_range = kw['start_time']-((60*60*24)*2) # 10 minutes => 10 point
+    query_string=f"SELECT * from c where\
+        c.device_id = '{kw['device_id']}' \
+        and c.timestamp >= {time_range}\
+        and c.timestamp <= {kw['start_time']} \
+        order by c.timestamp DESC OFFSET 0 LIMIT {(60*24)}"
     
 
     res = []
@@ -48,43 +87,64 @@ def main(mytimer: func.TimerRequest) -> None:
 
     today = now_element.strftime("%Y-%m-%d 00:00")
     today_element = datetime.strptime(today, "%Y-%m-%d %H:%M")
-    #today_element = pytz.utc.localize(today_element, is_dst=None).astimezone(tz)
     date = datetime.timestamp(today_element)
+    date = int(date) - (60*60*7)
     logging.info(f"today: {today}")
     logging.info(f"today timezone {tz}: {today_element}")
     logging.info(f"today timestamp timezone {tz}: {date}")
 
+    month = now_element.strftime("%Y-%m-1 00:00")
+    month_element = datetime.strptime(month, "%Y-%m-%d %H:%M")
+    month_ts = datetime.timestamp(month_element)
+    month_ts = int(month_ts) - (60*60*7)
+    logging.info(f"month: {month_element}")
+    logging.info(f"month timestamp timezone {tz}: {month_ts}")
+
     device_id = ["mbm1","mbm2","mbm3","mbm4"]
     point = []
-    ebill_rate = 7 #bath/kWh
+    ebill_rate = electricity_rate() #bath/kWh
     for item in device_id:
-            start_data = query_cosmos_ts(
-                device_id=item,
-                start_time=int(date), 
-                end_time=int(date)+600
-            )
-            now_data = query_cosmos_ts(
-                device_id=item,
-                start_time=int(now_ts)-600, 
-                end_time=int(now_ts)
-            )
+        start_month = query_cosmos_ts(
+            device_id=item,
+            start_time=int(month_ts), 
+            end_time=int(month_ts)+600
+        )
+        start_data = query_cosmos_ts(
+            device_id=item,
+            start_time=int(date), 
+            end_time=int(date)+600
+        )
+        now_data = query_cosmos_ts(
+            device_id=item,
+            start_time=int(now_ts)-600, 
+            end_time=int(now_ts)
+        )
+        power_W = query_power_1440min(
+            device_id=item,
+            start_time=int(now_ts)
+        )
             
-            for i in range(len(now_data[0]['meter_data'])):
-                if i < 48:
-                    energy_instance = float(now_data[0]['meter_data'][i+48]['value'])-float(start_data[-1]['meter_data'][i+48]['value'])
-                    point.append({
-                        "mbm":item,
-                        "ct":str(i+1),
-                        "power_kW":float(now_data[0]['meter_data'][i]['value'])/1000,
-                        "energy_kW":energy_instance/1000,
-                        "ebill":(energy_instance*ebill_rate)/1000
-                    })
-                else:
-                    break
+        for i in range(len(now_data[0]['meter_data'])):
+            if i < 48:
+                daily_energy = float(now_data[0]['meter_data'][i+48]['value'])-float(start_data[-1]['meter_data'][i+48]['value'])
+                monthly_energy = float(now_data[0]['meter_data'][i+48]['value'])-float(start_month[-1]['meter_data'][i+48]['value'])
+                avg_W = sum([float(avg['meter_data'][i]['value']) for avg in power_W])/(60*24)
+                point.append({
+                    "mbm":item,
+                    "ct":str(i+1),
+                    "avg_kW":avg_W/1000, #float(now_data[0]['meter_data'][i]['value'])/1000,
+                    "daily_kWh":daily_energy/1000,
+                    "daily_ebill":(daily_energy*ebill_rate)/1000,
+                    "monthly_kWh":monthly_energy/1000,
+                    "monthly_ebill":(monthly_energy*ebill_rate)/1000
+                })
+            else:
+                break
     ret = {
         "device_id":"daily",
         "timestamp":int(now_ts),
         "datetime":str(now_element),
+        "gatewayid": "lidombmmonitor",
         "point":point
     }
     container.upsert_item(ret)
